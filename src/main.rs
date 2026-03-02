@@ -1,4 +1,6 @@
+mod branches_view;
 mod code_view;
+mod diff_code_view;
 mod diff_view;
 mod git_status;
 mod tree_view;
@@ -7,13 +9,15 @@ use std::env;
 
 use eframe::{egui, App};
 use git_status::{
-    list_changes, list_repo_files, read_repo_file, repo_diff, repo_diff_for_path, ChangeItem,
+    list_branches, list_changes, list_repo_files, read_repo_file, repo_diff, repo_diff_for_path,
+    repo_split_diff, repo_split_diff_for_path, BranchScope, ChangeItem, SplitDiffModel,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeftView {
     Files,
     Diff,
+    Branches,
 }
 
 struct GitizenApp {
@@ -22,9 +26,16 @@ struct GitizenApp {
     files: Vec<String>,
     selected_file: Option<String>,
     selected_file_content: String,
+    local_branches: Vec<String>,
+    remote_branches: Vec<String>,
+    selected_local_branch: Option<String>,
+    selected_remote_branch: Option<String>,
+    branch_panel_state: branches_view::BranchPanelState,
     diff_output: String,
     selected_diff_path: Option<String>,
     selected_diff_output: String,
+    selected_split_diff: SplitDiffModel,
+    diff_render_mode: diff_code_view::DiffRenderMode,
     diff_panel_state: diff_view::DiffPanelState,
     left_panel_open: bool,
     left_view: LeftView,
@@ -43,9 +54,16 @@ impl Default for GitizenApp {
             files: Vec::new(),
             selected_file: None,
             selected_file_content: String::new(),
+            local_branches: Vec::new(),
+            remote_branches: Vec::new(),
+            selected_local_branch: None,
+            selected_remote_branch: None,
+            branch_panel_state: branches_view::BranchPanelState::default(),
             diff_output: String::new(),
             selected_diff_path: None,
             selected_diff_output: String::new(),
+            selected_split_diff: SplitDiffModel::default(),
+            diff_render_mode: diff_code_view::DiffRenderMode::default(),
             diff_panel_state: diff_view::DiffPanelState::default(),
             left_panel_open: true,
             left_view: LeftView::Files,
@@ -59,13 +77,17 @@ impl GitizenApp {
         let changes = list_changes(&self.workspace);
         let files = list_repo_files(&self.workspace);
         let diff = repo_diff(&self.workspace);
+        let local_branches = list_branches(&self.workspace, BranchScope::Local);
+        let remote_branches = list_branches(&self.workspace, BranchScope::Remote);
 
-        match (changes, files, diff) {
-            (Ok(changes), Ok(files), Ok(diff_output)) => {
+        match (changes, files, diff, local_branches, remote_branches) {
+            (Ok(changes), Ok(files), Ok(diff_output), Ok(local_branches), Ok(remote_branches)) => {
                 self.error = None;
                 self.changes = changes;
                 self.files = files;
                 self.diff_output = diff_output;
+                self.local_branches = local_branches;
+                self.remote_branches = remote_branches;
 
                 let selected_missing = match self.selected_file.as_ref() {
                     Some(selected) => !self.files.iter().any(|file| file == selected),
@@ -81,22 +103,43 @@ impl GitizenApp {
                 if selected_diff_missing {
                     self.selected_diff_path = None;
                 }
+                let selected_local_missing = match self.selected_local_branch.as_ref() {
+                    Some(selected) => !self.local_branches.iter().any(|branch| branch == selected),
+                    None => false,
+                };
+                if selected_local_missing {
+                    self.selected_local_branch = None;
+                }
+                let selected_remote_missing = match self.selected_remote_branch.as_ref() {
+                    Some(selected) => !self.remote_branches.iter().any(|branch| branch == selected),
+                    None => false,
+                };
+                if selected_remote_missing {
+                    self.selected_remote_branch = None;
+                }
                 self.load_selected_file_content();
                 self.load_selected_diff_content();
             }
-            (changes_res, files_res, diff_res) => {
+            (changes_res, files_res, diff_res, local_res, remote_res) => {
                 self.changes.clear();
                 self.files.clear();
                 self.selected_file = None;
                 self.selected_file_content.clear();
+                self.local_branches.clear();
+                self.remote_branches.clear();
+                self.selected_local_branch = None;
+                self.selected_remote_branch = None;
                 self.diff_output.clear();
                 self.selected_diff_path = None;
                 self.selected_diff_output.clear();
+                self.selected_split_diff = SplitDiffModel::default();
 
                 let message = changes_res
                     .err()
                     .or_else(|| files_res.err())
                     .or_else(|| diff_res.err())
+                    .or_else(|| local_res.err())
+                    .or_else(|| remote_res.err())
                     .map(|err| err.to_string())
                     .unwrap_or_else(|| "Unknown error while refreshing".to_string());
                 self.error = Some(message);
@@ -119,6 +162,7 @@ impl GitizenApp {
     fn load_selected_diff_content(&mut self) {
         let Some(path) = self.selected_diff_path.as_deref() else {
             self.selected_diff_output = self.diff_output.clone();
+            self.selected_split_diff = repo_split_diff(&self.workspace).unwrap_or_default();
             return;
         };
 
@@ -126,6 +170,7 @@ impl GitizenApp {
             Ok(text) => text,
             Err(err) => format!("Unable to load diff for {path}:\n{err}"),
         };
+        self.selected_split_diff = repo_split_diff_for_path(&self.workspace, path).unwrap_or_default();
     }
 }
 
@@ -158,6 +203,7 @@ impl App for GitizenApp {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.left_view, LeftView::Files, "Files");
                         ui.selectable_value(&mut self.left_view, LeftView::Diff, "Diff");
+                        ui.selectable_value(&mut self.left_view, LeftView::Branches, "Branches");
                     });
                     ui.separator();
 
@@ -256,6 +302,25 @@ impl App for GitizenApp {
                                 self.load_selected_diff_content();
                             }
                         }
+                        LeftView::Branches => {
+                            ui.heading("Branches");
+                            ui.separator();
+                            if let Some(action) = branches_view::render_sidebar(
+                                ui,
+                                &self.local_branches,
+                                &self.remote_branches,
+                                &mut self.branch_panel_state,
+                                self.selected_local_branch.as_deref(),
+                                self.selected_remote_branch.as_deref(),
+                            ) {
+                                let branches_view::BranchAction::SelectBranch { scope, name } =
+                                    action;
+                                match scope {
+                                    BranchScope::Local => self.selected_local_branch = Some(name),
+                                    BranchScope::Remote => self.selected_remote_branch = Some(name),
+                                }
+                            }
+                        }
                     }
                 });
         }
@@ -289,9 +354,34 @@ impl App for GitizenApp {
                         ui.heading("Repository Diff");
                     }
                     ui.separator();
-                    egui::ScrollArea::both().show(ui, |ui| {
-                        ui.monospace(&self.selected_diff_output);
-                    });
+                    diff_code_view::render_mode_switch(ui, &mut self.diff_render_mode);
+                    ui.separator();
+                    diff_code_view::render(
+                        ui,
+                        &self.selected_diff_output,
+                        Some(&self.selected_split_diff),
+                        self.diff_render_mode,
+                    );
+                }
+                LeftView::Branches => {
+                    ui.heading("Branch Details");
+                    ui.separator();
+                    match self.branch_panel_state.scope {
+                        BranchScope::Local => {
+                            if let Some(branch) = &self.selected_local_branch {
+                                ui.label(format!("Scope: Local\nSelected: {branch}"));
+                            } else {
+                                ui.label("Scope: Local\nNo branch selected");
+                            }
+                        }
+                        BranchScope::Remote => {
+                            if let Some(branch) = &self.selected_remote_branch {
+                                ui.label(format!("Scope: Remote\nSelected: {branch}"));
+                            } else {
+                                ui.label("Scope: Remote\nNo branch selected");
+                            }
+                        }
+                    }
                 }
             }
         });

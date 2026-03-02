@@ -8,4 +8,5 @@ eframe = "0.33"
 egui = "0.33"
 egui_extras = "0.33"
 git2 = { version = "0.20.4", features = ["vendored-libgit2", "vendored-openssl"] }
+similar = "2.7"
 thiserror = "2.0"
