@@ -1,16 +1,21 @@
+mod branch_selector;
 mod branches_view;
 mod code_view;
 mod diff_code_view;
 mod diff_view;
 mod git_status;
+mod project_selector;
+mod repo_actions;
 mod tree_view;
 
 use std::env;
 
 use eframe::{egui, App};
 use git_status::{
-    list_branches, list_changes, list_repo_files, read_repo_file, repo_diff, repo_diff_for_path,
-    repo_split_diff, repo_split_diff_for_path, BranchScope, ChangeItem, SplitDiffModel,
+    checkout_local_branch, checkout_reference, checkout_remote_branch, create_local_branch,
+    current_local_branch, git_fetch, git_pull, git_push, list_branches, list_changes,
+    list_repo_files, read_repo_file, repo_diff, repo_diff_for_path, repo_split_diff,
+    repo_split_diff_for_path, BranchScope, ChangeItem, SplitDiffModel,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,8 +25,10 @@ enum LeftView {
     Branches,
 }
 
-struct GitizenApp {
+struct GitBrainsApp {
     workspace: String,
+    open_projects: Vec<String>,
+    recent_projects: Vec<String>,
     changes: Vec<ChangeItem>,
     files: Vec<String>,
     selected_file: Option<String>,
@@ -37,18 +44,21 @@ struct GitizenApp {
     selected_split_diff: SplitDiffModel,
     diff_render_mode: diff_code_view::DiffRenderMode,
     diff_panel_state: diff_view::DiffPanelState,
+    branch_selector_state: branch_selector::BranchSelectorState,
     left_panel_open: bool,
     left_view: LeftView,
     error: Option<String>,
 }
 
-impl Default for GitizenApp {
+impl Default for GitBrainsApp {
     fn default() -> Self {
         let workspace = env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| String::new());
 
         Self {
+            open_projects: vec![workspace.clone()],
+            recent_projects: Vec::new(),
             workspace,
             changes: Vec::new(),
             files: Vec::new(),
@@ -65,6 +75,7 @@ impl Default for GitizenApp {
             selected_split_diff: SplitDiffModel::default(),
             diff_render_mode: diff_code_view::DiffRenderMode::default(),
             diff_panel_state: diff_view::DiffPanelState::default(),
+            branch_selector_state: branch_selector::BranchSelectorState::default(),
             left_panel_open: true,
             left_view: LeftView::Files,
             error: None,
@@ -72,7 +83,66 @@ impl Default for GitizenApp {
     }
 }
 
-impl GitizenApp {
+impl GitBrainsApp {
+    fn handle_repo_action(&mut self, action: repo_actions::RepoAction) {
+        match action {
+            repo_actions::RepoAction::Fetch => match git_fetch(&self.workspace) {
+                Ok(_) => {
+                    self.branch_selector_state.message = Some("fetch completed".to_string());
+                    self.refresh();
+                }
+                Err(err) => {
+                    self.branch_selector_state.message = Some(err.to_string());
+                }
+            },
+            repo_actions::RepoAction::PullMerge => match git_pull(&self.workspace, false) {
+                Ok(_) => {
+                    self.branch_selector_state.message = Some("pull (merge) completed".to_string());
+                    self.refresh();
+                }
+                Err(err) => {
+                    self.branch_selector_state.message = Some(err.to_string());
+                }
+            },
+            repo_actions::RepoAction::PullRebase => match git_pull(&self.workspace, true) {
+                Ok(_) => {
+                    self.branch_selector_state.message = Some("pull (rebase) completed".to_string());
+                    self.refresh();
+                }
+                Err(err) => {
+                    self.branch_selector_state.message = Some(err.to_string());
+                }
+            },
+            repo_actions::RepoAction::Commit => {
+                self.branch_selector_state.message =
+                    Some("commit action is not implemented".to_string());
+            }
+            repo_actions::RepoAction::Push => match git_push(&self.workspace) {
+                Ok(_) => {
+                    self.branch_selector_state.message = Some("push completed".to_string());
+                    self.refresh();
+                }
+                Err(err) => {
+                    self.branch_selector_state.message = Some(err.to_string());
+                }
+            },
+        }
+    }
+
+    fn switch_workspace(&mut self, path: String) {
+        if self.workspace != path {
+            if !self.recent_projects.iter().any(|p| p == &self.workspace) {
+                self.recent_projects.insert(0, self.workspace.clone());
+            }
+            self.recent_projects.retain(|p| p != &path);
+            self.workspace = path.clone();
+        }
+        if !self.open_projects.iter().any(|p| p == &path) {
+            self.open_projects.push(path);
+        }
+        self.refresh();
+    }
+
     fn refresh(&mut self) {
         let changes = list_changes(&self.workspace);
         let files = list_repo_files(&self.workspace);
@@ -109,6 +179,11 @@ impl GitizenApp {
                 };
                 if selected_local_missing {
                     self.selected_local_branch = None;
+                }
+                if let Ok(current) = current_local_branch(&self.workspace) {
+                    if current.is_some() {
+                        self.selected_local_branch = current;
+                    }
                 }
                 let selected_remote_missing = match self.selected_remote_branch.as_ref() {
                     Some(selected) => !self.remote_branches.iter().any(|branch| branch == selected),
@@ -174,24 +249,100 @@ impl GitizenApp {
     }
 }
 
-impl App for GitizenApp {
+impl App for GitBrainsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let toggle_label = if self.left_panel_open {
-                    "Hide Left Panel"
-                } else {
-                    "Show Left Panel"
-                };
-                if ui.button(toggle_label).clicked() {
-                    self.left_panel_open = !self.left_panel_open;
+                if let Some(action) = project_selector::render_dropdown(
+                    ui,
+                    &self.workspace,
+                    &self.open_projects,
+                    &self.recent_projects,
+                ) {
+                    match action {
+                        project_selector::ProjectAction::OpenFolder => {
+                            if let Some(path) = project_selector::open_folder_dialog() {
+                                self.switch_workspace(path);
+                            }
+                        }
+                        project_selector::ProjectAction::CloneRepository => {}
+                        project_selector::ProjectAction::SwitchWorkspace(path) => {
+                            self.switch_workspace(path)
+                        }
+                    }
                 }
-                ui.label("Workspace:");
-                ui.text_edit_singleline(&mut self.workspace);
-                if ui.button("Refresh Status").clicked() {
-                    self.refresh();
+
+                ui.add_space(12.0);
+                ui.label("Branch");
+                if let Some(action) = branch_selector::render_dropdown(
+                    ui,
+                    &mut self.branch_selector_state,
+                    self.selected_local_branch.as_deref(),
+                    &self.local_branches,
+                    &self.remote_branches,
+                ) {
+                    match action {
+                        branch_selector::BranchSelectorAction::CreateBranch { name } => {
+                            match create_local_branch(&self.workspace, &name) {
+                                Ok(_) => {
+                                    self.branch_selector_state.message =
+                                        Some(format!("branch created: {name}"));
+                                    self.refresh();
+                                }
+                                Err(err) => {
+                                    self.branch_selector_state.message = Some(err.to_string());
+                                }
+                            }
+                        }
+                        branch_selector::BranchSelectorAction::CheckoutReference { reference } => {
+                            match checkout_reference(&self.workspace, &reference) {
+                                Ok(_) => {
+                                    self.branch_selector_state.message =
+                                        Some(format!("checked out: {reference}"));
+                                    self.refresh();
+                                }
+                                Err(err) => {
+                                    self.branch_selector_state.message = Some(err.to_string());
+                                }
+                            }
+                        }
+                        branch_selector::BranchSelectorAction::CheckoutLocalBranch { name } => {
+                            match checkout_local_branch(&self.workspace, &name) {
+                                Ok(_) => {
+                                    self.branch_selector_state.message =
+                                        Some(format!("switched to local branch: {name}"));
+                                    self.refresh();
+                                }
+                                Err(err) => {
+                                    self.branch_selector_state.message = Some(err.to_string());
+                                }
+                            }
+                        }
+                        branch_selector::BranchSelectorAction::CheckoutRemoteBranch { name } => {
+                            match checkout_remote_branch(&self.workspace, &name) {
+                                Ok(local) => {
+                                    self.branch_selector_state.message = Some(format!(
+                                        "switched to remote branch as local: {local}"
+                                    ));
+                                    self.refresh();
+                                }
+                                Err(err) => {
+                                    self.branch_selector_state.message = Some(err.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                if let Some(repo_action) = repo_actions::render_inline(ui) {
+                    self.handle_repo_action(repo_action);
                 }
             });
+            ui.add_space(4.0);
         });
 
         if self.left_panel_open {
@@ -391,10 +542,10 @@ impl App for GitizenApp {
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Gitizen",
+        "Gitbrains",
         native_options,
         Box::new(|_cc| {
-            let mut app = GitizenApp::default();
+            let mut app = GitBrainsApp::default();
             app.refresh();
             Ok(Box::new(app))
         }),
