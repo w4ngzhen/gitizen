@@ -1,6 +1,7 @@
 use std::fs;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use git2::{BranchType, Diff, DiffFormat, DiffOptions, Patch, Repository, Status, StatusEntry, StatusOptions};
 use similar::{ChangeTag, TextDiff};
@@ -49,6 +50,10 @@ pub enum GitStatusError {
     OpenRepo(#[from] git2::Error),
     #[error("Failed to read file {path}: {source}")]
     ReadFile { path: String, source: std::io::Error },
+    #[error("{0}")]
+    Message(String),
+    #[error("Git command failed: {0}")]
+    GitCommand(String),
 }
 
 pub fn list_changes(workspace: &str) -> Result<Vec<ChangeItem>, GitStatusError> {
@@ -113,6 +118,159 @@ pub fn list_branches(workspace: &str, scope: BranchScope) -> Result<Vec<String>,
 
     branches.sort();
     Ok(branches)
+}
+
+pub fn current_local_branch(workspace: &str) -> Result<Option<String>, GitStatusError> {
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    let repo = Repository::discover(&workspace_path)?;
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(_) => return Ok(None),
+    };
+    if !head.is_branch() {
+        return Ok(None);
+    }
+    Ok(head.shorthand().map(ToOwned::to_owned))
+}
+
+pub fn git_fetch(workspace: &str) -> Result<(), GitStatusError> {
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    let repo = Repository::discover(&workspace_path)?;
+    let remotes = repo.remotes()?;
+    if remotes.is_empty() {
+        return Err(GitStatusError::Message("no remote branch".to_string()));
+    }
+
+    run_git_command(&workspace_path, &["fetch"])?;
+    Ok(())
+}
+
+pub fn git_pull(workspace: &str, rebase: bool) -> Result<(), GitStatusError> {
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+    if rebase {
+        run_git_command(&workspace_path, &["pull", "--rebase"])?;
+    } else {
+        run_git_command(&workspace_path, &["pull"])?;
+    }
+    Ok(())
+}
+
+pub fn git_push(workspace: &str) -> Result<(), GitStatusError> {
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+    run_git_command(&workspace_path, &["push"])?;
+    Ok(())
+}
+
+pub fn create_local_branch(workspace: &str, name: &str) -> Result<(), GitStatusError> {
+    let branch_name = name.trim();
+    if branch_name.is_empty() {
+        return Err(GitStatusError::Message(
+            "branch name cannot be empty".to_string(),
+        ));
+    }
+
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    let repo = Repository::discover(&workspace_path)?;
+    let head_commit = repo.head()?.peel_to_commit()?;
+    repo.branch(branch_name, &head_commit, false)?;
+    Ok(())
+}
+
+pub fn checkout_local_branch(workspace: &str, name: &str) -> Result<(), GitStatusError> {
+    let branch_name = name.trim();
+    if branch_name.is_empty() {
+        return Err(GitStatusError::Message(
+            "branch name cannot be empty".to_string(),
+        ));
+    }
+
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    run_git_command(&workspace_path, &["checkout", branch_name])?;
+    Ok(())
+}
+
+pub fn checkout_remote_branch(workspace: &str, remote_name: &str) -> Result<String, GitStatusError> {
+    let remote_branch = remote_name.trim();
+    if remote_branch.is_empty() {
+        return Err(GitStatusError::Message(
+            "remote branch name cannot be empty".to_string(),
+        ));
+    }
+
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    let local_name = remote_branch
+        .split_once('/')
+        .map(|(_, tail)| tail.to_string())
+        .unwrap_or_else(|| remote_branch.to_string());
+
+    let create_attempt = run_git_command(
+        &workspace_path,
+        &["checkout", "--track", "-b", &local_name, remote_branch],
+    );
+    if create_attempt.is_err() {
+        run_git_command(&workspace_path, &["checkout", &local_name])?;
+    }
+
+    Ok(local_name)
+}
+
+pub fn checkout_reference(workspace: &str, reference: &str) -> Result<(), GitStatusError> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Err(GitStatusError::Message(
+            "reference cannot be empty".to_string(),
+        ));
+    }
+
+    let workspace_path = PathBuf::from(workspace.trim());
+    if !workspace_path.exists() {
+        return Err(GitStatusError::WorkspaceNotFound(
+            workspace_path.display().to_string(),
+        ));
+    }
+
+    run_git_command(&workspace_path, &["checkout", reference])?;
+    Ok(())
 }
 
 pub fn list_repo_files(workspace: &str) -> Result<Vec<String>, GitStatusError> {
@@ -565,6 +723,29 @@ fn format_status_code(status: Status) -> String {
     let staged = staged_code(status);
     let unstaged = unstaged_code(status);
     format!("{staged}{unstaged}")
+}
+
+fn run_git_command(workspace_path: &Path, args: &[&str]) -> Result<(), GitStatusError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace_path)
+        .output()
+        .map_err(|err| GitStatusError::GitCommand(err.to_string()))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "unknown git error".to_string()
+        };
+        Err(GitStatusError::GitCommand(detail))
+    }
 }
 
 fn staged_code(status: Status) -> char {
